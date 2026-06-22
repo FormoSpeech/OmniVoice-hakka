@@ -61,6 +61,34 @@ pip install torch==2.8.0 torchaudio==2.8.0
 
 </details>
 
+<details>
+<summary>Intel Arc GPU (XPU)</summary>
+
+Intel Arc GPUs (Alchemist and Battlemage architectures) are supported via PyTorch's XPU backend.
+
+1. Install the [Intel GPU drivers](https://dgpu-docs.intel.com/driver/installation.html) for your OS.
+
+2. Install PyTorch with XPU support from Intel's wheel index:
+
+```bash
+pip install torch torchaudio --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+```
+
+> See [Intel's PyTorch XPU guide](https://intel.github.io/intel-extension-for-pytorch/xpu/latest/) for version-specific instructions.
+
+3. Verify the backend is working:
+
+```bash
+python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+```
+
+**Notes**:
+- `flash_attn` is not available on XPU; the model automatically falls back to SDPA.
+- Training with packed sequences (`flex_attention`) has partial XPU support; single-GPU SDPA training should work.
+- Tested on Arc A310 (Alchemist, 4 GB) and Arc Pro B50 (Battlemage, 16 GB).
+
+</details>
+
 **Step 2**: Install OmniVoice (choose one)
 
 ```bash
@@ -125,6 +153,7 @@ model = OmniVoice.from_pretrained(
     dtype=torch.float16
 )
 # Apple Silicon users: use device_map="mps" instead
+# Intel Arc GPU users: use device_map="xpu" instead
 
 audio = model.generate(
     text="Hello, this is a test of zero-shot voice cloning.",
@@ -161,7 +190,7 @@ audio = model.generate(
 )
 ```
 
-> **Note**: Voice design was trained on Chinese and English data only. It can generalize to other languages, but results can be unstable for some low-resource languages.
+> **Note**: The model is primarily trained on the voice cloning task, so voice cloning is the most stable mode. Voice design is trained on Chinese and English data only. It can generalize to other languages, but may produce unstable results for some low-resource languages or edge cases.
 
 See [docs/voice-design.md](docs/voice-design.md) for the full attribute
 reference, Chinese equivalents, and usage tips.
@@ -299,14 +328,8 @@ You can also scan the QR code to join our wechat group or follow our wechat offi
 
 ## Community Projects
 
-- **[omnivoice-server](https://github.com/maemreyo/omnivoice-server)** —
-  OpenAI-compatible HTTP server for serving OmniVoice via `/v1/audio/speech`.
-  Supports voice profiles for persistent cloning, sentence-level streaming,
-  and optional Bearer auth.
-
-- **[omnivoice-rs](https://github.com/FerrisMind/omnivoice-rs)** —
-  GPU-first Rust workspace for OmniVoice inference, parity validation, CLI
-  execution, and an OpenAI-compatible HTTP server built with Candle.
+OmniVoice is supported by a growing ecosystem of community projects.
+Explore them in [Community Projects](docs/community-projects.md).
 
 ---
 
@@ -320,3 +343,9 @@ You can also scan the QR code to join our wechat group or follow our wechat offi
       year={2026}
 }
 ```
+
+---
+
+## Disclaimer
+
+Users are strictly prohibited from using this model for unauthorized voice cloning, voice impersonation, fraud, scams, or any other illegal or unethical activities. All users shall ensure full compliance with applicable local laws, regulations, and ethical standards. The developers assume no liability for any misuse of this model and advocate for responsible AI development and use, encouraging the community to uphold safety and ethical principles in AI research and applications.

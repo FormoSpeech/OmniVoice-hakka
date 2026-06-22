@@ -38,10 +38,16 @@ from typing import Any, List, Optional, Union
 
 import numpy as np
 import torch
-import torchaudio
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
+import torchaudio
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    _flex_attention_available = True
+except ImportError:
+    _flex_attention_available = False
 from transformers import (
     AutoFeatureExtractor,
     AutoModel,
@@ -183,9 +189,18 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_codebook_weights = audio_codebook_weights
 
 
+def _resolve_model_path(name_or_path: str) -> str:
+    if os.path.isdir(name_or_path):
+        return name_or_path
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(name_or_path)
+
+
 class OmniVoice(PreTrainedModel):
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     config_class = OmniVoiceConfig
 
     def __init__(self, config: OmniVoiceConfig, llm: Optional[PreTrainedModel] = None):
@@ -239,31 +254,23 @@ class OmniVoice(PreTrainedModel):
         logging.disable(logging.INFO)
 
         try:
-            model = super().from_pretrained(
-                pretrained_model_name_or_path, *args, **kwargs
-            )
+            # Resolve to local path first; download only if not already cached
+            resolved_path = _resolve_model_path(pretrained_model_name_or_path)
+
+            model = super().from_pretrained(resolved_path, *args, **kwargs)
 
             if not train_mode:
-                # Resolve local path for audio tokenizer subdirectory
-                if os.path.isdir(pretrained_model_name_or_path):
-                    resolved_path = pretrained_model_name_or_path
-                else:
-                    from huggingface_hub import snapshot_download
-
-                    resolved_path = snapshot_download(pretrained_model_name_or_path)
-
-                model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
-                )
+                model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
                 if not os.path.isdir(audio_tokenizer_path):
-                    # Fallback to the HuggingFace Hub path of transformers'
-                    # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+                    audio_tokenizer_path = _resolve_model_path(
+                        "eustlb/higgs-audio-v2-tokenizer"
+                    )
 
-                # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
+                # higgs-audio-v2-tokenizer does not support MPS
+                # (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
@@ -293,14 +300,17 @@ class OmniVoice(PreTrainedModel):
         """Load a Whisper ASR model for reference audio transcription.
 
         Args:
-            model_name: HuggingFace model name for the Whisper model.
+            model_name: HuggingFace model name or local path for the Whisper model.
         """
         from transformers import pipeline as hf_pipeline
 
         logger.info("Loading ASR model %s ...", model_name)
         asr_dtype = (
-            torch.float16 if str(self.device).startswith("cuda") else torch.float32
+            torch.float16 if str(self.device).startswith(("cuda", "xpu")) else torch.float32
         )
+
+        model_name = _resolve_model_path(model_name)
+
         self._asr_pipe = hf_pipeline(
             "automatic-speech-recognition",
             model=model_name,
@@ -383,6 +393,12 @@ class OmniVoice(PreTrainedModel):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
+            if not _flex_attention_available:
+                raise RuntimeError(
+                    "flex_attention is not available in the current environment. "
+                    "If you do not need flex_attention, set "
+                    '"attn_implementation": "sdpa" in your training config.'
+                )
             attention_mask = create_block_mask(
                 _get_packed_mask(
                     document_ids[0].to(inputs_embeds.device),
@@ -624,11 +640,13 @@ class OmniVoice(PreTrainedModel):
                 waveform = np.mean(waveform, axis=0, keepdims=True)
             if sr != self.sampling_rate:
                 waveform = torchaudio.functional.resample(
-                    torch.from_numpy(waveform), orig_freq=sr, new_freq=self.sampling_rate,
+                    torch.from_numpy(waveform),
+                    orig_freq=sr,
+                    new_freq=self.sampling_rate,
                 ).numpy()
             ref_wav = waveform
 
-        ref_rms = float(np.sqrt(np.mean(ref_wav ** 2)))
+        ref_rms = float(np.sqrt(np.mean(ref_wav**2)))
         if 0 < ref_rms < 0.1:
             ref_wav = ref_wav * 0.1 / ref_rms
 
@@ -674,9 +692,7 @@ class OmniVoice(PreTrainedModel):
         clip_size = int(ref_wav.shape[-1] % chunk_size)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
         # numpy → torch at tokenizer boundary
-        ref_wav_tensor = torch.from_numpy(ref_wav).to(
-            self.audio_tokenizer.device
-        )
+        ref_wav_tensor = torch.from_numpy(ref_wav).to(self.audio_tokenizer.device)
         ref_audio_tokens = self.audio_tokenizer.encode(
             ref_wav_tensor.unsqueeze(0),
         ).audio_codes.squeeze(
@@ -1211,7 +1227,7 @@ class OmniVoice(PreTrainedModel):
         timesteps = _get_time_steps(
             t_start=0.0,
             t_end=1.0,
-            num_step=gen_config.num_step + 1,
+            num_step=gen_config.num_step,
             t_shift=gen_config.t_shift,
         ).tolist()
         schedules = []
