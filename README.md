@@ -180,7 +180,8 @@ sf.write("out.wav", audio[0], 24000)
 Describe the desired voice with speaker attributes — no reference audio needed.
 Supported attributes: **gender** (male/female), **age** (child to elderly),
 **pitch** (very low to very high), **style** (whisper), **English accent**
-(American, British, etc.), and **Chinese dialect** (四川话, 陕西话, etc.).
+(American, British, etc.), and **Chinese dialect** (四川话, 陕西话, 客語四縣腔,
+客語海陸腔, 客語南四縣腔, etc.).
 Attributes are comma-separated and freely combinable across categories.
 
 ```python

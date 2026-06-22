@@ -101,6 +101,12 @@ Only effective when the synthesis text is in Chinese.
 | 宁夏话 |
 | 青岛话 |
 | 东北话 |
+| 客語四縣腔 |
+| 客語海陸腔 |
+| 客語大埔腔 |
+| 客語饒平腔 |
+| 客語詔安腔 |
+| 客語南四縣腔 |
 
 ## Writing Instruct Strings
 
@@ -116,6 +122,9 @@ for Chinese — the model auto-fixes mismatches).
 
 # Mixed (auto-normalised)
 "female, young adult, 四川话"
+
+# Hakka dialect
+"女，青年，客語南四縣腔"
 ```
 
 ### Tips
