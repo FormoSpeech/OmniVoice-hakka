@@ -1,0 +1,12 @@
+{
+    "train": [
+        {
+            "manifest_path": ["data/formospeech_hakka_r_mixed/tokens_cln/train/data.lst"]
+        }
+    ],
+    "dev": [
+        {
+            "manifest_path": ["data/formospeech_hakka_r_mixed/tokens_cln/dev/data.lst"]
+        }
+    ]
+}

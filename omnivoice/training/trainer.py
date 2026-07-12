@@ -35,8 +35,8 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import DeepSpeedPlugin, InitProcessGroupKwargs, set_seed
 from torch.utils.data import DataLoader
 from transformers import (
-    get_cosine_schedule_with_warmup,
     get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
 )
 
 from omnivoice.training.checkpoint import TrainLogger, load_checkpoint
@@ -87,7 +87,11 @@ class OmniTrainer:
             ] = 1
 
         # 4. Prepare with Accelerator
-        (self.model, self.optimizer, self.lr_scheduler,) = self.accelerator.prepare(
+        (
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+        ) = self.accelerator.prepare(
             self.model,
             self.optimizer,
             self.lr_scheduler,
@@ -122,7 +126,7 @@ class OmniTrainer:
         accelerator = Accelerator(
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             mixed_precision=self.config.mixed_precision,
-            log_with="tensorboard",
+            log_with=["tensorboard", "wandb"],
             project_dir=self.config.output_dir,
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs, init_kwargs],
@@ -155,7 +159,7 @@ class OmniTrainer:
 
         logger.info(f"Loaded Config: {self.config}")
         set_seed(self.config.seed)
-        accelerator.init_trackers("tensorboard")
+        accelerator.init_trackers("omnivoice-trainer")
         return accelerator
 
     def create_optimizer_and_scheduler(self):
@@ -293,9 +297,7 @@ class OmniTrainer:
                         grad_norm = self.accelerator.clip_grad_norm_(
                             self.model.parameters(), self.config.max_grad_norm
                         )
-                        grad_norm = (
-                            grad_norm.item() if grad_norm is not None else 0.0
-                        )
+                        grad_norm = grad_norm.item() if grad_norm is not None else 0.0
 
                     self.optimizer.step()
                     self.lr_scheduler.step()

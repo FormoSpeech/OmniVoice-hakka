@@ -1,0 +1,7 @@
+{
+    "train": [
+        {
+            "manifest_path": ["data/formospeech_hakka_reading_denoised/tokens_cln/train/data.lst"]
+        }
+    ]
+}

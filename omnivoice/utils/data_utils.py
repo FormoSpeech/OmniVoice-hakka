@@ -56,6 +56,7 @@ def read_test_list(path):
             sample = {
                 "id": obj.get("id"),
                 "text": obj.get("text"),
+                "audio_path": obj.get("audio_path"),
                 "ref_audio": obj.get("ref_audio"),
                 "ref_text": obj.get("ref_text"),
                 "language_id": obj.get("language_id"),
@@ -63,6 +64,8 @@ def read_test_list(path):
                 "duration": obj.get("duration"),
                 "speed": obj.get("speed"),
                 "instruct": obj.get("instruct"),
+                "speaker": obj.get("speaker"),
+                "text_pinyin": obj.get("text_pinyin"),
             }
             samples.append(sample)
     return samples
