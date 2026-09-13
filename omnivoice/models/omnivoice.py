@@ -57,6 +57,7 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 from omnivoice.utils.audio import (
@@ -68,7 +69,11 @@ from omnivoice.utils.audio import (
 )
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
-from omnivoice.utils.text import add_punctuation, chunk_text_punctuation
+from omnivoice.utils.text import (
+    add_punctuation,
+    chunk_text_punctuation,
+    normalize_text as _normalize_text,
+)
 from omnivoice.utils.voice_design import (
     _INSTRUCT_ALL_VALID,
     _INSTRUCT_DIALECTS,
@@ -82,10 +87,38 @@ from omnivoice.utils.voice_design import (
 
 logger = logging.getLogger(__name__)
 
+_AUTOCAST_FLEX_ATTENTION = "omnivoice_flex_attention"
+
+
+def _autocast_flex_attention(module, query, key, value, *args, **kwargs):
+    """flex_attention with the same autocast treatment SDPA already gets.
+
+    Mixed-precision training keeps fp32 master weights, so Qwen3's
+    ``q_norm``/``k_norm`` (fp32 weight x bf16 activation) silently promote
+    q/k — and, through the fp32 RoPE constants, v — back to fp32. SDPA is
+    on autocast's cast list and is downcast at the kernel boundary;
+    ``flex_attention`` is not, so with ``attn_implementation:
+    "flex_attention"`` all attention math runs in fp32: the fp32 backward
+    template is ~12x slower at head_dim=128 (61.8ms vs 5.1ms per
+    layer-call, H100, identical mask/shape/layout), and the flex and sdpa
+    paths become numerically inconsistent with each other. Casting here
+    restores the treatment autocast applies to every other matmul; softmax
+    accumulation inside the kernel is fp32 either way.
+    """
+    if torch.is_autocast_enabled(query.device.type) and query.dtype == torch.float32:
+        dtype = torch.get_autocast_dtype(query.device.type)
+        query, key, value = (t.to(dtype) for t in (query, key, value))
+    return ALL_ATTENTION_FUNCTIONS["flex_attention"](
+        module, query, key, value, *args, **kwargs
+    )
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+
+_VOICE_CLONE_PROMPT_FORMAT_VERSION = 1
 
 
 @dataclass
@@ -93,6 +126,51 @@ class VoiceClonePrompt:
     ref_audio_tokens: torch.Tensor  # (C, T)
     ref_text: str
     ref_rms: float
+
+    def save(self, path: str) -> None:
+        """Save this prompt to ``path`` for reuse in a later session.
+
+        The file stores a plain dict with the audio tokens moved to CPU, so
+        it can be loaded with ``torch.load(weights_only=True)`` (the default
+        since torch 2.6) and is portable across devices.
+
+        Args:
+            path: Destination file path (e.g. ``"my_voice.pt"``).
+        """
+        torch.save(
+            {
+                "format_version": _VOICE_CLONE_PROMPT_FORMAT_VERSION,
+                "ref_audio_tokens": self.ref_audio_tokens.detach().cpu(),
+                "ref_text": self.ref_text,
+                "ref_rms": float(self.ref_rms),
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str, map_location: str = "cpu") -> "VoiceClonePrompt":
+        """Load a prompt saved with :meth:`save`.
+
+        The returned prompt can be passed directly to
+        :meth:`OmniVoice.generate`; the audio tokens are moved to the model
+        device automatically during generation, so no manual ``.to(device)``
+        is needed.
+
+        Args:
+            path: File path previously written by :meth:`save`.
+            map_location: Device to load the audio tokens onto.
+        Returns:
+            The restored :class:`VoiceClonePrompt`.
+        """
+        data = torch.load(path, map_location=map_location, weights_only=True)
+        version = data.get("format_version")
+        if version != _VOICE_CLONE_PROMPT_FORMAT_VERSION:
+            raise ValueError(f"Unsupported VoiceClonePrompt format version: {version}")
+        return cls(
+            ref_audio_tokens=data["ref_audio_tokens"],
+            ref_text=data["ref_text"],
+            ref_rms=data["ref_rms"],
+        )
 
 
 @dataclass
@@ -108,6 +186,8 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    pad_duration: float = 0.1
+    fade_duration: float = 0.1
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -213,6 +293,12 @@ class OmniVoice(PreTrainedModel):
             # Otherwise, initialize the LLM from the config.
             self.llm = AutoModel.from_config(self.config.llm_config)
 
+        if self.llm.config._attn_implementation == "flex_attention":
+            AttentionInterface.register(
+                _AUTOCAST_FLEX_ATTENTION, _autocast_flex_attention
+            )
+            self.llm.set_attn_implementation(_AUTOCAST_FLEX_ATTENTION)
+
         self.audio_embeddings = nn.Embedding(
             config.num_audio_codebook * config.audio_vocab_size,
             self.config.llm_config.hidden_size,
@@ -241,12 +327,15 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+        self._asr_model_name = "openai/whisper-large-v3-turbo"
+        self._asr_device = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
+        asr_model_name = kwargs.pop("asr_model_name", None)
+        asr_device = kwargs.pop("asr_device", None)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
         _prev_disable = logging.root.manager.disable
@@ -284,8 +373,12 @@ class OmniVoice(PreTrainedModel):
 
                 model.duration_estimator = RuleDurationEstimator()
 
+                if asr_model_name is not None:
+                    model._asr_model_name = asr_model_name
+                if asr_device is not None:
+                    model._asr_device = asr_device
                 if load_asr:
-                    model.load_asr_model(model_name=asr_model_name)
+                    model.load_asr_model()
         finally:
             logging.disable(_prev_disable)
 
@@ -295,30 +388,46 @@ class OmniVoice(PreTrainedModel):
     # ASR support (optional, for auto-transcription)
     # -------------------------------------------------------------------
 
-    def load_asr_model(self, model_name: str = "openai/whisper-large-v3-turbo"):
+    def load_asr_model(
+        self, model_name: Optional[str] = None, device: Optional[str] = None
+    ):
         """Load a Whisper ASR model for reference audio transcription.
 
         Args:
-            model_name: HuggingFace model name or local path for the Whisper model.
+            model_name: HuggingFace model name or local path for the Whisper
+                model. Defaults to the ``asr_model_name`` passed to
+                :meth:`from_pretrained` (``openai/whisper-large-v3-turbo``
+                if unset).
+            device: Device to load the ASR model on (e.g. ``"cuda:1"`` or
+                ``"cpu"``). Defaults to the ``asr_device`` passed to
+                :meth:`from_pretrained`, falling back to the main model's
+                device (its first shard when sharded across GPUs).
         """
         from transformers import pipeline as hf_pipeline
 
+        if model_name is None:
+            model_name = self._asr_model_name
+        if device is None:
+            device = self._asr_device if self._asr_device is not None else self.device
+
         logger.info("Loading ASR model %s ...", model_name)
         asr_dtype = (
-            torch.float16
-            if str(self.device).startswith(("cuda", "xpu"))
-            else torch.float32
+            torch.float16 if str(device).startswith(("cuda", "xpu")) else torch.float32
         )
 
         model_name = _resolve_model_path(model_name)
 
+        # Use `device=` (single-device placement) rather than `device_map=`:
+        # pipeline() ignores a plain device string in `device_map` and
+        # auto-selects an accelerator, which is why the ASR model could not
+        # be moved off the default GPU (#180).
         self._asr_pipe = hf_pipeline(
             "automatic-speech-recognition",
             model=model_name,
             dtype=asr_dtype,
-            device_map=self.device,
+            device=device,
         )
-        logger.info("ASR model loaded on %s.", self.device)
+        logger.info("ASR model loaded on %s.", device)
 
     @torch.inference_mode()
     def transcribe(
@@ -492,6 +601,7 @@ class OmniVoice(PreTrainedModel):
         duration: Union[float, list[Optional[float]], None] = None,
         speed: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        normalize_text: bool = False,
         **kwargs,
     ) -> list[np.ndarray]:
         """Generate speech audio given text in various modes.
@@ -513,7 +623,8 @@ class OmniVoice(PreTrainedModel):
             ref_text: Optional reference text for voice cloning mode.
             ref_audio: Optional reference audio for voice cloning mode.
                 Can be a file path or a (waveform, sample_rate) tuple.
-            voice_clone_prompt: Reusable prompt from :meth:`create_voice_clone_prompt`.
+            voice_clone_prompt: Reusable prompt from :meth:`create_voice_clone_prompt`
+                or :meth:`VoiceClonePrompt.load`.
                 If provided, it overrides ``ref_text`` and ``ref_audio``.
             instruct: Style instruction for voice design mode.
             duration: Fixed output duration in seconds. If a single float,
@@ -523,6 +634,15 @@ class OmniVoice(PreTrainedModel):
             speed: Speaking speed factor. ``> 1.0`` for faster, ``< 1.0`` for
                 slower. If a list, one value per item. ``None`` (default) uses
                 the model's default estimation.
+            normalize_text: If ``True``, run text normalization on the target
+                text before synthesis (numbers, dates, currency, etc. are
+                converted to their spoken form, e.g. ``"2345"`` ->
+                ``"twenty three forty five"``). Default ``False`` (paper
+                reproducibility is unaffected). Chinese/English require the
+                optional ``omnivoice[tn]`` dependency (WeTextProcessing); other
+                languages use ``num2words`` for bare integers when installed.
+                Inline control syntax (``[laughter]``, ``[B EY1 S]``, pinyin
+                tone markers) is preserved. See :func:`omnivoice.utils.text.normalize_text`.
             generation_config: Explicit config object. If provided, takes
                 precedence over ``**kwargs``.
             **kwargs: Generation config or its fields:
@@ -539,6 +659,10 @@ class OmniVoice(PreTrainedModel):
                     this duration (seconds) and generate chunk by chunk.
                 audio_chunk_threshold: Only apply chunking if estimated audio
                     duration exceeds this threshold (seconds).
+                pad_duration: Silence padding duration per side in seconds
+                    (0 to disable).
+                fade_duration: Fade-in/out curve duration in seconds
+                    (0 to disable).
         Returns:
             ``audios`` a list of 1-D ``np.ndarray`` with shape ``(T,)`` and
             sampling rate consistent with the model's audio tokenizer
@@ -569,6 +693,7 @@ class OmniVoice(PreTrainedModel):
             preprocess_prompt=gen_config.preprocess_prompt,
             speed=speed,
             duration=duration,
+            normalize_text=normalize_text,
         )
 
         short_idx, long_idx = full_task.get_indices(
@@ -742,27 +867,27 @@ class OmniVoice(PreTrainedModel):
 
         audio_waveform = self._post_process_audio(
             audio_waveform,
-            postprocess_output=gen_config.postprocess_output,
             ref_rms=rms,
+            gen_config=gen_config,
         )
         return audio_waveform.squeeze(0)
 
     def _post_process_audio(
         self,
         generated_audio: np.ndarray,
-        postprocess_output: bool,
         ref_rms: Union[float, None],
+        gen_config: OmniVoiceGenerationConfig,
     ) -> np.ndarray:
         """Optionally remove long silences, adjust volume, and add edge padding.
 
         Args:
             generated_audio: Numpy array of shape (1, T).
-            postprocess_output: If True, remove long silences and apply fade/pad.
             ref_rms: RMS of the reference audio for volume normalisation.
+            gen_config: Generation config controlling post-processing behaviour.
         Returns:
             Processed numpy array of shape (1, T).
         """
-        if postprocess_output:
+        if gen_config.postprocess_output:
             generated_audio = remove_silence(
                 generated_audio,
                 self.sampling_rate,
@@ -780,6 +905,8 @@ class OmniVoice(PreTrainedModel):
 
         generated_audio = fade_and_pad_audio(
             generated_audio,
+            pad_duration=gen_config.pad_duration,
+            fade_duration=gen_config.fade_duration,
             sample_rate=self.sampling_rate,
         )
         return generated_audio
@@ -914,6 +1041,7 @@ class OmniVoice(PreTrainedModel):
         preprocess_prompt: bool = True,
         speed: Union[float, list[Optional[float]], None] = None,
         duration: Union[float, list[Optional[float]], None] = None,
+        normalize_text: bool = False,
     ) -> GenerationTask:
         if isinstance(text, str):
             text_list = [text]
@@ -926,6 +1054,14 @@ class OmniVoice(PreTrainedModel):
 
         language_list = self._ensure_list(language, batch_size)
         language_list = [_resolve_language(lang) for lang in language_list]
+
+        # Optional text normalization (opt-in). Applied to the target text only
+        # (not ref_text, which must stay aligned with the reference audio),
+        # before duration estimation so the estimate matches the spoken form.
+        if normalize_text:
+            text_list = [
+                _normalize_text(t, lang) for t, lang in zip(text_list, language_list)
+            ]
         instruct_list = self._ensure_list(instruct, batch_size)
         for i, s in enumerate(instruct_list):
             if s is None:
