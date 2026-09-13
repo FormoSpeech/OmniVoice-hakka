@@ -12,6 +12,9 @@ If you have a project you'd like to add, please open a PR.
 - **[vLLM-Omni](https://github.com/vllm-project/vllm-omni)** —
   A framework for efficient model inference with omni-modality model. Supports OmniVoice serving.
 
+- **[audio.cpp](https://github.com/0xShug0/audio.cpp)** —
+  An all-in-one, pure C++ inference engine for audio models (TTS, ASR, music gen,etc), powered by GGML.
+  
 - **[pyVideoTrans](https://github.com/jianchang512/pyvideotrans)** —
   Video translation tool with dubbing & subtitles. Supports OmniVoice as a TTS engine.
 
@@ -49,6 +52,12 @@ If you have a project you'd like to add, please open a PR.
 - **[Auris](https://github.com/nikhilprasanth/Auris)** —
   Offline audiobook reader for EPUB, PDF, and TXT with local OmniVoice TTS, character-aware voices, and per-book narrator control.
 
+- **[LA Studio](https://github.com/dduongtrandai/LA-Studio)** —
+  Offline desktop AI audio workstation for local TTS, voice cloning, and voice design workflows with OmniVoice support.
+
 - **[tts-audiobook-tool](https://github.com/zeropointnine/tts-audiobook-tool)** —
   Audiobook creation tool supporting a dozen different TTS models including OmniVoice, Qwen3-TTS, VibeVoice, etc.,
   focused on high-quality output
+
+- **[LocalText2Voice](https://github.com/estebanstifli/LocalText2Voice)** —
+  User-friendly Windows desktop pipeline for long-form audiobook and podcast production with OmniVoice support, voice-library management, chapter-aware generation, Whisper-based segment review and retries, multi-voice markup, music/SFX mixing, and MCP automation.
