@@ -185,6 +185,15 @@ def detect_dialect_from_id(sample_id: str) -> str:
     return DIALECT_CODE_MAP[dialect_key]
 
 
+def resolve_dialect_code(sample_id: str, language_name: str | None = None) -> str:
+    """Prefer an explicit `language_name` field (e.g. "Hakka_Sixian"); fall
+    back to parsing it out of the sample id for test lists that don't carry
+    that field (the legacy dev_test_list.jsonl convention)."""
+    if language_name and language_name in DIALECT_CODE_MAP:
+        return DIALECT_CODE_MAP[language_name]
+    return detect_dialect_from_id(sample_id)
+
+
 def load_jsonl(path: str):
     rows = []
     with Path(path).open("r", encoding="utf-8") as f:
@@ -247,23 +256,30 @@ def worker_init(rank_queue, args_dict):
 
 def prepare_texts(sample, manifest_index, mode):
     if mode == "g2p":
-        ref_dialect = detect_dialect_from_id(sample["ref_id"])
-        gen_dialect = detect_dialect_from_id(sample["id"])
+        ref_dialect = resolve_dialect_code(sample["ref_id"], sample.get("language_name"))
+        gen_dialect = resolve_dialect_code(sample["id"], sample.get("language_name"))
         ref_text = to_pinyin(sample["ref_text"], ref_dialect)
         gen_text = to_pinyin(sample["text"], gen_dialect)
         return ref_text, gen_text
 
     if not sample.get("text_pinyin"):
         raise ValueError(f"Missing text_pinyin for sample {sample['id']}")
-    ref_id = sample.get("ref_id")
-    if not ref_id:
-        raise ValueError(f"Missing ref_id for sample {sample['id']}")
-    ref_sample = manifest_index.get(ref_id)
-    if ref_sample is None:
-        raise ValueError(f"ref_id {ref_id} not found in manifest")
-    ref_text_pinyin = ref_sample.get("text_pinyin")
+
+    # Prefer a pinyin transcript embedded directly on the sample (this
+    # repo's newer self-contained test lists); fall back to looking the
+    # ref up in an external manifest by ref_id (legacy dev_test_list.jsonl
+    # convention, where ref rows live in a separate manifest file).
+    ref_text_pinyin = sample.get("ref_text_pinyin")
     if not ref_text_pinyin:
-        raise ValueError(f"Missing text_pinyin for ref_id {ref_id}")
+        ref_id = sample.get("ref_id")
+        if not ref_id:
+            raise ValueError(f"Missing ref_id for sample {sample['id']}")
+        ref_sample = manifest_index.get(ref_id)
+        if ref_sample is None:
+            raise ValueError(f"ref_id {ref_id} not found in manifest")
+        ref_text_pinyin = ref_sample.get("text_pinyin")
+        if not ref_text_pinyin:
+            raise ValueError(f"Missing text_pinyin for ref_id {ref_id}")
 
     ref_text = normalize_pinyin(ref_text_pinyin.lower())
     gen_text = normalize_pinyin(sample["text_pinyin"].lower())
